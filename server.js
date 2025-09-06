@@ -1,79 +1,87 @@
+// server.js
 import express from 'express';
 import cors from 'cors';
 import morgan from 'morgan';
-import ytdl from 'ytdl-core';
 
 const app = express();
 
-// 允许你的前端/桌面调用（先放开 * ，后面你可以改成你自己的域名）
-app.use(cors());
+// 允许你的前端/桌面调用
+app.use(cors());          // 现在先开放 * ，之后可按你的域名收敛
 app.use(morgan('tiny'));
 
+// 健康检查
 app.get('/healthz', (req, res) => {
   res.json({ ok: true, ts: Date.now() });
 });
 
-// 简单校验 YouTube 链接/ID
-function normalizeYouTubeUrl(input) {
+// —— 工具：从 URL/ID 提取 YouTube 视频 ID —— //
+function getYouTubeId(input) {
   try {
-    // 先当 URL 解析
-    const u = new URL(input);
-    if (u.hostname.includes('youtube.com') || u.hostname.includes('youtu.be')) {
-      return u.toString();
+    const s = decodeURIComponent(String(input || '').trim());
+    // 原始就是 ID 的情况
+    if (/^[A-Za-z0-9_-]{6,}$/.test(s) && !/^https?:/i.test(s)) return s;
+
+    // 解析 URL
+    const u = new URL(s);
+
+    // youtu.be/XXXX
+    if (u.hostname.includes('youtu.be')) {
+      const id = u.pathname.replace(/^\/+/, '');
+      if (id) return id;
     }
+
+    // www.youtube.com/watch?v=XXXX
+    const v = u.searchParams.get('v');
+    if (v) return v;
+
+    // shorts/XXXX
+    const m = u.pathname.match(/shorts\/([A-Za-z0-9_-]{6,})/);
+    if (m) return m[1];
+
+    return null;
   } catch {
-    // 不是 URL，当作视频 ID
-    if (/^[A-Za-z0-9_-]{6,}$/.test(input)) {
-      return `https://www.youtube.com/watch?v=${input}`;
-    }
+    return null;
   }
-  return null;
 }
 
-/**
- * /fetch?url=<YouTube链接或ID>
- * 返回：把 YouTube 音频（audio-only） 直接以流的方式输出（通常是 webm/opus）
- * 说明：我们不转码、不存储，只做“中转”，AssemblyAI 可接受 webm/opus 等常见音频容器。
- */
+// —— 用 RapidAPI 获取下载信息 —— //
 app.get('/fetch', async (req, res) => {
+  const raw = req.query.url || '';
+  const videoId = getYouTubeId(raw);
+
+  if (!videoId) {
+    return res.status(400).json({ error: 'Invalid YouTube URL or ID' });
+  }
+
+  const RAPID_HOST = process.env.RAPIDAPI_HOST; // 例：youtube-mp36.p.rapidapi.com
+  const RAPID_KEY  = process.env.RAPIDAPI_KEY;
+
+  if (!RAPID_HOST || !RAPID_KEY) {
+    return res.status(500).json({ error: 'Server missing RapidAPI credentials' });
+  }
+
   try {
-    const raw = req.query.url || '';
-    const ytUrl = normalizeYouTubeUrl(raw);
-    if (!ytUrl) {
-      return res.status(400).json({ error: 'Invalid YouTube URL or ID' });
-    }
-
-    // 检查视频是否有效
-    const info = await ytdl.getInfo(ytUrl).catch(() => null);
-    if (!info) {
-      return res.status(404).json({ error: 'Video not found or not accessible' });
-    }
-
-    // 选择音频流（不含视频）
-    // ytdl 默认给 webm/opus，AssemblyAI 可以识别；若你强制需要 mp3，才需要引入 ffmpeg 转码（成本高/易超时）
-    const audio = ytdl(ytUrl, {
-      quality: 'highestaudio',
-      filter: 'audioonly',
-      highWaterMark: 1 << 24 // 提高水位，避免在免费机型上卡顿
+    const endpoint = `https://${RAPID_HOST}/dl?id=${encodeURIComponent(videoId)}`;
+    const r = await fetch(endpoint, {
+      headers: {
+        'x-rapidapi-key': RAPID_KEY,
+        'x-rapidapi-host': RAPID_HOST,
+      },
     });
 
-    // 给一些有用的头
-    res.setHeader('Content-Type', 'audio/webm'); // 多数情况下是 webm/opus
-    res.setHeader('Cache-Control', 'no-store');
-    // Content-Disposition 让浏览器别强制下载
-    res.setHeader('Content-Disposition', 'inline; filename="audio.webm"');
+    const text = await r.text();
+    let data;
+    try { data = JSON.parse(text); } catch { data = { raw: text }; }
 
-    audio.on('error', (e) => {
-      console.error('[ytdl error]', e?.message);
-      if (!res.headersSent) res.status(502).json({ error: 'Fetch audio failed' });
-      try { audio.destroy(); } catch {}
-    });
+    // RapidAPI 非 2xx 也原样透传给前端，便于排错
+    if (!r.ok) {
+      return res.status(r.status).json({ error: 'RapidAPI error', details: data });
+    }
 
-    // 管道输出
-    audio.pipe(res);
+    return res.json(data);
   } catch (e) {
-    console.error('[fetch error]', e?.message);
-    res.status(500).json({ error: e?.message || 'Server error' });
+    console.error('[fetch error]', e?.message || e);
+    return res.status(502).json({ error: 'Failed to fetch from RapidAPI' });
   }
 });
 
